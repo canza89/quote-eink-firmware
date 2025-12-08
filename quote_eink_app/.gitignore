@@ -1,0 +1,13 @@
+# Secrets (never commit real credentials)
+secrets.h
+wifi_credentials.h
+.env
+
+# Arduino build files
+*.bin
+*.hex
+*.elf
+
+# Mac junk
+.DS_Store
+
