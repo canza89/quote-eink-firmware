@@ -1,24 +1,28 @@
-// quote_eink_app.ino
+// quote_eink_app_v.1.0.2.ino
 
 // ----------------------------------------
-// --- CORE LIBRARY INCLUDES -------------
+// CORE LIBRARIES
 // ----------------------------------------
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
-#include <Update.h>  // OTA
-
-// --- E-INK DISPLAY LIBRARY -------------
-#include <heltec-eink-modules.h>
-
-// --- PROJECT HEADERS -------------------
-#include "secrets.h"
-#include "app_prefs.h"
-#include "provisioning.h"
+#include <Update.h>               // For OTA
 
 // ----------------------------------------
-// --- GLOBALS ---------------------------
+// DISPLAY LIBRARY (Heltec Vision Master E290)
+// ----------------------------------------
+#include <heltec-eink-modules.h>
+
+// ----------------------------------------
+// PROJECT HEADERS
+// ----------------------------------------
+#include "secrets.h"              // FW_VERSION, GITHUB_OTA_META_URL, FIREBASE_API_KEY, FIREBASE_PROJECT_ID, etc.
+#include "app_prefs.h"            // readNVS, writeNVS, isProvisioned
+#include "provisioning.h"         // startProvisioning, WIFI_CONNECT_TIMEOUT_MS, QUOTE_INTERVAL_MS
+
+// ----------------------------------------
+// GLOBALS
 // ----------------------------------------
 
 // E-ink display object for Heltec Vision Master E290
@@ -29,22 +33,48 @@ unsigned long lastQuoteUpdate = 0;
 unsigned long lastUpdateCheck = 0;
 
 // Firebase Auth state (REST-based)
-String firebaseIdToken;          // ID token (for Authorization: Bearer ...)
-String firebaseRefreshToken;     // (not used yet but stored if you want refresh later)
-unsigned long firebaseTokenExpiryMs = 0;  // millis() when token expires (approx)
+String firebaseIdToken;          // ID token (Authorization: Bearer ...)
+String firebaseRefreshToken;     // Not used yet
+unsigned long firebaseTokenExpiryMs = 0;  // millis() when token expires
 String firebaseUserUid;          // localId returned by signInWithPassword
 
 // ----------------------------------------
-// --- DISPLAY HELPERS -------------------
+// DISPLAY HELPERS
 // ----------------------------------------
 
-// Simple status screen (small, left-aligned)
+// Draw small version text (e.g. "v1.0.1") bottom-right
+void drawVersionBadge() {
+  String versionStr = "v";
+  versionStr += FW_VERSION;     // e.g. FW_VERSION "1.0.1" -> "v1.0.1"
+
+  display.setTextSize(1);
+
+  int screenWidth  = display.width();
+  int screenHeight = display.height();
+
+  int charWidth    = 6;         // approx built-in font width at textSize=1
+  int lineWidthPx  = versionStr.length() * charWidth;
+
+  int marginX = 4;
+  int marginY = 8;
+
+  int x = screenWidth  - lineWidthPx - marginX;
+  int y = screenHeight - marginY;  // bottom area
+
+  display.setCursor(x, y);
+  display.println(versionStr);
+}
+
 void displayStatus(const String &msg) {
   Serial.println("[DISPLAY] " + msg);
   display.clearMemory();
   display.setCursor(0, 0);
   display.setTextSize(1);
   display.println(msg);
+
+  // Draw version in bottom-right corner
+  drawVersionBadge();
+
   display.update();
 }
 
@@ -57,8 +87,8 @@ void displayError(const String& msg) {
   displayStatus("Error:\n" + msg);
 }
 
-// Helper: wrap and center multiline text for the quote
-// Uses display.width() so it stays correct in landscape/portrait.
+// Wrap + center multiline text.
+// Uses display.width() so it respects rotation.
 void printWrappedCentered(const String &text,
                           int maxCharsPerLine,
                           int &cursorY,
@@ -68,7 +98,7 @@ void printWrappedCentered(const String &text,
 
   int len = text.length();
   int start = 0;
-  int screenWidthPx = display.width();   // <-- respects rotation
+  int screenWidthPx = display.width();
 
   while (start < len) {
     int end = start + maxCharsPerLine;
@@ -87,8 +117,8 @@ void printWrappedCentered(const String &text,
     line.trim();
 
     if (line.length() > 0) {
-      int lineLen = line.length();
-      int charWidth = 6 * textSize;  // approx built-in font width
+      int lineLen    = line.length();
+      int charWidth  = 6 * textSize;  // approx built-in font width
       int lineWidthPx = lineLen * charWidth;
 
       int startX = 0;
@@ -107,16 +137,12 @@ void printWrappedCentered(const String &text,
 }
 
 // Main formatted quote renderer
-// - Big centered quote text
-// - Smaller centered author line
-// - Tags line near bottom
 void displayQuote(const String& text,
                   const String& author,
                   const String& tagsLine) {
   Serial.println("[DISPLAY] Rendering formatted quote...");
   display.clearMemory();
 
-  // Layout constants (using rotated dimensions)
   int screenWidth  = display.width();
   int screenHeight = display.height();
 
@@ -124,11 +150,10 @@ void displayQuote(const String& text,
 
   // 1) Quote text (big, centered, wrapped)
   const int maxQuoteChars   = 24;   // for textSize=2
-  const int quoteLineHeight = 20;   // pixels between lines
-
+  const int quoteLineHeight = 20;
   printWrappedCentered(text, maxQuoteChars, y, quoteLineHeight, 2);
 
-  // Add a bit of spacing before author
+  // Extra spacing before author
   y += 4;
 
   // 2) Author (small, centered)
@@ -145,10 +170,10 @@ void displayQuote(const String& text,
 
     display.setTextSize(authorTextSize);
 
-    int lineLen    = authorLine.length();
-    int charWidth  = 6 * authorTextSize;
+    int lineLen     = authorLine.length();
+    int charWidth   = 6 * authorTextSize;
     int lineWidthPx = lineLen * charWidth;
-    int startX = 0;
+    int startX      = 0;
     if (lineWidthPx < screenWidth) {
       startX = (screenWidth - lineWidthPx) / 2;
     }
@@ -169,10 +194,10 @@ void displayQuote(const String& text,
       t = t.substring(0, maxTagChars - 3) + "...";
     }
 
-    int lineLen    = t.length();
-    int charWidth  = 6 * tagsTextSize;
+    int lineLen     = t.length();
+    int charWidth   = 6 * tagsTextSize;
     int lineWidthPx = lineLen * charWidth;
-    int yTags = screenHeight - 14;  // a bit above bottom
+    int yTags       = screenHeight - 14;
 
     int startX = 0;
     if (lineWidthPx < screenWidth) {
@@ -183,11 +208,14 @@ void displayQuote(const String& text,
     display.println(t);
   }
 
+  // Draw version in bottom-right corner
+  drawVersionBadge();
+
   display.update();
 }
 
 // ----------------------------------------
-// --- WIFI SETUP ------------------------
+// WIFI
 // ----------------------------------------
 
 void connectWiFi() {
@@ -227,7 +255,7 @@ void connectWiFi() {
 }
 
 // ----------------------------------------
-// --- FIREBASE AUTH (REST) --------------
+// FIREBASE AUTH (REST)
 // ----------------------------------------
 
 void clearFirebaseCredentials() {
@@ -239,7 +267,6 @@ void clearFirebaseCredentials() {
   firebaseTokenExpiryMs = 0;
 }
 
-// Sign in with email/password via REST
 bool firebaseSignIn() {
   String fbEmail    = readNVS("fb_email");
   String fbPassword = readNVS("fb_password");
@@ -264,7 +291,7 @@ bool firebaseSignIn() {
     FIREBASE_API_KEY;
 
   WiFiClientSecure client;
-  client.setInsecure();   // TODO: load proper root cert for full TLS validation
+  client.setInsecure();   // TODO: proper root cert
 
   HTTPClient http;
   if (!http.begin(client, url)) {
@@ -273,7 +300,6 @@ bool firebaseSignIn() {
     return false;
   }
 
-  // Build JSON payload
   DynamicJsonDocument payloadDoc(512);
   payloadDoc["email"] = fbEmail;
   payloadDoc["password"] = fbPassword;
@@ -316,7 +342,6 @@ bool firebaseSignIn() {
     return false;
   }
 
-  // Parse required fields
   firebaseIdToken      = respDoc["idToken"].as<String>();
   firebaseRefreshToken = respDoc["refreshToken"].as<String>();
   firebaseUserUid      = respDoc["localId"].as<String>();
@@ -330,10 +355,9 @@ bool firebaseSignIn() {
 
   unsigned long expiresSec = expiresInStr.toInt();
   if (expiresSec == 0) {
-    expiresSec = 3600; // default to 1h if parsing fails
+    expiresSec = 3600;
   }
 
-  // Refresh a bit early (60s before actual expiry)
   firebaseTokenExpiryMs = millis() + (expiresSec - 60) * 1000UL;
 
   Serial.println("[FIREBASE] Sign-in OK.");
@@ -346,7 +370,6 @@ bool firebaseSignIn() {
   return true;
 }
 
-// Ensure we have a valid token; sign in again if needed
 bool ensureFirebaseAuth() {
   if (firebaseIdToken.isEmpty() || firebaseUserUid.isEmpty() ||
       millis() > firebaseTokenExpiryMs) {
@@ -358,10 +381,9 @@ bool ensureFirebaseAuth() {
 }
 
 // ----------------------------------------
-// --- FIRESTORE (REST, AUTH'D) ----------
+// FIRESTORE (REST)
 // ----------------------------------------
 
-// Build Firestore REST URL for listDocuments on users/<UID>/quotes
 String buildFirestoreListUrl() {
   String url =
     "https://firestore.googleapis.com/v1/projects/";
@@ -372,7 +394,6 @@ String buildFirestoreListUrl() {
   return url;
 }
 
-// Fetch quotes via authenticated REST and display a random one
 void fetchAndDisplayQuote() {
   if (WiFi.status() != WL_CONNECTED) {
     displayError("Wi-Fi not connected.");
@@ -397,7 +418,7 @@ void fetchAndDisplayQuote() {
   displayStatus("Fetching quote\nfrom Firestore...");
 
   WiFiClientSecure client;
-  client.setInsecure(); // TODO: use proper CA cert in production
+  client.setInsecure();
 
   HTTPClient http;
   if (!http.begin(client, url)) {
@@ -406,7 +427,6 @@ void fetchAndDisplayQuote() {
     return;
   }
 
-  // Auth header with ID token
   String authHeader = "Bearer " + firebaseIdToken;
   http.addHeader("Authorization", authHeader);
 
@@ -453,7 +473,6 @@ void fetchAndDisplayQuote() {
   String text   = fields["text"]["stringValue"]   | "";
   String author = fields["author"]["stringValue"] | "";
 
-  // Build tags line from Firestore array field "tagNames" (if present)
   String tagsLine = "";
   if (fields.containsKey("tagNames")) {
     JsonVariant tagsVariant = fields["tagNames"]["arrayValue"]["values"];
@@ -484,10 +503,9 @@ void fetchAndDisplayQuote() {
 }
 
 // ----------------------------------------
-// --- OTA UPDATE (GitHub) ---------------
+// OTA (GITHUB)
 // ----------------------------------------
 
-// Compare two version strings "x.y.z" as integers
 bool isNewerVersion(const String &remote, const String &current) {
   int rMaj = 0, rMin = 0, rPatch = 0;
   int cMaj = 0, cMin = 0, cPatch = 0;
@@ -644,7 +662,7 @@ void checkForUpdate() {
 }
 
 // ----------------------------------------
-// --- SETUP & LOOP ----------------------
+// SETUP & LOOP
 // ----------------------------------------
 
 void setup() {
@@ -670,7 +688,7 @@ void setup() {
 
   connectWiFi();
 
-  // Optional: check for update at boot
+  // Check for update immediately at boot
   checkForUpdate();
 
   // First auth + initial quote
@@ -694,8 +712,8 @@ void loop() {
     lastQuoteUpdate = millis();
   }
 
-  // Daily OTA check
-  if (millis() - lastUpdateCheck >= 86400000UL) { // 24h
+  // Daily OTA check (every 24 hours)
+  if (millis() - lastUpdateCheck >= 86400000UL) { // 24 * 60 * 60 * 1000
     checkForUpdate();
     lastUpdateCheck = millis();
   }
