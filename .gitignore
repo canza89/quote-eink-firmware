@@ -1,0 +1,14 @@
+# Arduino project
+quote_eink_app/build/
+quote_eink_app/*.bin
+quote_eink_app/*.hex
+quote_eink_app/*.elf
+
+# Secrets (never commit real credentials)
+quote_eink_app/secrets.h
+quote_eink_app/wifi_credentials.h
+.env
+
+# macOS
+.DS_Store
+
