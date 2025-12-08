@@ -1,4 +1,12 @@
-// quote_eink_app_v.1.0.2.ino
+// quote_eink_app.ino
+//
+// Quote E-Ink App for Heltec Vision Master E290 (ESP32-S3)
+// - Wi-Fi provisioning
+// - Firebase Auth (REST, email+password from NVS)
+// - Firestore quotes for logged-in user
+// - GitHub OTA (firmware.json + .bin)
+// - Rollback-safe OTA (only mark new firmware valid after successful boot)
+// - Version badge in bottom-right corner
 
 // ----------------------------------------
 // CORE LIBRARIES
@@ -8,6 +16,13 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <Update.h>               // For OTA
+
+// ----------------------------------------
+// ESP-IDF OTA APIs (for rollback-safe OTA)
+// ----------------------------------------
+extern "C" {
+  #include "esp_ota_ops.h"
+}
 
 // ----------------------------------------
 // DISPLAY LIBRARY (Heltec Vision Master E290)
@@ -42,10 +57,10 @@ String firebaseUserUid;          // localId returned by signInWithPassword
 // DISPLAY HELPERS
 // ----------------------------------------
 
-// Draw small version text (e.g. "v1.0.1") bottom-right
+// Draw small version text (e.g. "v1.0.3") bottom-right
 void drawVersionBadge() {
   String versionStr = "v";
-  versionStr += FW_VERSION;     // e.g. FW_VERSION "1.0.1" -> "v1.0.1"
+  versionStr += FW_VERSION;     // e.g. FW_VERSION "1.0.3" -> "v1.0.3"
 
   display.setTextSize(1);
 
@@ -65,6 +80,7 @@ void drawVersionBadge() {
   display.println(versionStr);
 }
 
+// Generic status screen (small text, top-left) + version badge
 void displayStatus(const String &msg) {
   Serial.println("[DISPLAY] " + msg);
   display.clearMemory();
@@ -72,7 +88,7 @@ void displayStatus(const String &msg) {
   display.setTextSize(1);
   display.println(msg);
 
-  // Draw version in bottom-right corner
+  // Version badge in corner
   drawVersionBadge();
 
   display.update();
@@ -136,7 +152,7 @@ void printWrappedCentered(const String &text,
   }
 }
 
-// Main formatted quote renderer
+// Main formatted quote renderer in landscape
 void displayQuote(const String& text,
                   const String& author,
                   const String& tagsLine) {
@@ -208,7 +224,7 @@ void displayQuote(const String& text,
     display.println(t);
   }
 
-  // Draw version in bottom-right corner
+  // Version badge bottom-right
   drawVersionBadge();
 
   display.update();
@@ -503,9 +519,10 @@ void fetchAndDisplayQuote() {
 }
 
 // ----------------------------------------
-// OTA (GITHUB)
+// OTA (GITHUB) + ROLLBACK-SAFE HANDLING
 // ----------------------------------------
 
+// Compare "1.2.3" style semantic versions
 bool isNewerVersion(const String &remote, const String &current) {
   int rMaj = 0, rMin = 0, rPatch = 0;
   int cMaj = 0, cMin = 0, cPatch = 0;
@@ -518,6 +535,7 @@ bool isNewerVersion(const String &remote, const String &current) {
   return rPatch > cPatch;
 }
 
+// Actual flash to other OTA partition
 bool performOTA(const String &binUrl) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[OTA] Wi-Fi not connected.");
@@ -554,7 +572,7 @@ bool performOTA(const String &binUrl) {
     return false;
   }
 
-  if (!Update.begin(contentLength)) {
+  if (!Update.begin(contentLength)) {  // writes to next OTA slot
     Serial.print("[OTA] Update.begin failed. Error: ");
     Serial.println(Update.errorString());
     http.end();
@@ -589,7 +607,7 @@ bool performOTA(const String &binUrl) {
     return false;
   }
 
-  Serial.println("[OTA] Update successful, restarting...");
+  Serial.println("[OTA] Update successful, restarting into test image...");
   http.end();
   displayStatus("Firmware updated.\nRebooting...");
   delay(2000);
@@ -597,6 +615,7 @@ bool performOTA(const String &binUrl) {
   return true; // not really reached
 }
 
+// Check GitHub meta JSON and decide whether to OTA
 void checkForUpdate() {
   Serial.println("[OTA] checkForUpdate()...");
 
@@ -661,6 +680,41 @@ void checkForUpdate() {
   }
 }
 
+// After rebooting into a new OTA slot, the bootloader
+// may mark the image as PENDING_VERIFY. If we *don't*
+// call esp_ota_mark_app_valid_cancel_rollback() and the
+// device reboots/crashes, the bootloader can roll back
+// to the previous image (when rollback is enabled).
+void finalizeOtaIfPending() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (!running) {
+    Serial.println("[OTA] No running partition info.");
+    return;
+  }
+
+  esp_ota_img_states_t state;
+  esp_err_t err = esp_ota_get_state_partition(running, &state);
+  if (err != ESP_OK) {
+    Serial.print("[OTA] esp_ota_get_state_partition failed: ");
+    Serial.println((int)err);
+    return;
+  }
+
+  Serial.print("[OTA] Current OTA image state: ");
+  Serial.println((int)state);
+
+  if (state == ESP_OTA_IMG_PENDING_VERIFY) {
+    Serial.println("[OTA] Image is PENDING_VERIFY. Marking as valid...");
+    err = esp_ota_mark_app_valid_cancel_rollback();
+    if (err == ESP_OK) {
+      Serial.println("[OTA] App marked valid; rollback cancelled.");
+    } else {
+      Serial.print("[OTA] Failed to mark app valid: ");
+      Serial.println((int)err);
+    }
+  }
+}
+
 // ----------------------------------------
 // SETUP & LOOP
 // ----------------------------------------
@@ -688,13 +742,19 @@ void setup() {
 
   connectWiFi();
 
-  // Check for update immediately at boot
+  // 🔹 Check for OTA update immediately at boot
   checkForUpdate();
 
-  // First auth + initial quote
+  // 🔹 Normal runtime: auth + one quote
   if (ensureFirebaseAuth()) {
     fetchAndDisplayQuote();
   }
+
+  // 🔹 At this point we've successfully booted, connected Wi-Fi,
+  //    logged into Firebase, and rendered at least one quote.
+  //    If this was a freshly updated OTA image in PENDING_VERIFY
+  //    state, we can now mark it as valid to avoid rollbacks.
+  finalizeOtaIfPending();
 
   lastQuoteUpdate = millis();
   lastUpdateCheck = millis();

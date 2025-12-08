@@ -1,4 +1,9 @@
 {
+<<<<<<< Updated upstream
   "version": "1.0.3",
   "binUrl": "https://raw.githubusercontent.com/canza89/quote-eink-firmware/main/bin/quote_eink_app_1_0_3.bin"
+=======
+  "version": "1.0.4",
+  "binUrl": "https://raw.githubusercontent.com/canza89/quote-eink-firmware/main/bin/quote_eink_app_1_0_4.bin"
+>>>>>>> Stashed changes
 }
