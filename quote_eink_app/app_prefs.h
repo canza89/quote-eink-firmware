@@ -13,4 +13,7 @@ void writeNVS(const char* key, const String& value);
 // Check if the device is provisioned (Wi-Fi + Firebase creds present)
 bool isProvisioned();
 
+// Clear all stored credentials (Wi-Fi + Firebase + provision flag)
+void clearAllCredentials();
+
 #endif
